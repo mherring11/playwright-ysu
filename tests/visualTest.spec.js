@@ -4,16 +4,19 @@ const path = require("path");
 const { PNG } = require("pngjs");
 const sharp = require("sharp");
 const config = require("../config.js");
-const axios = require("axios");
 
 let pixelmatch;
 let chalk;
 
+// Dynamically load `pixelmatch` and `chalk`
 (async () => {
   pixelmatch = (await import("pixelmatch")).default;
   chalk = (await import("chalk")).default;
 })();
 
+// Helper Functions
+
+// Ensure directory exists
 function ensureDirectoryExistence(filePath) {
   const dirname = path.dirname(filePath);
   if (!fs.existsSync(dirname)) {
@@ -21,6 +24,7 @@ function ensureDirectoryExistence(filePath) {
   }
 }
 
+// Resize images to match specified dimensions (1280x800)
 async function resizeImage(imagePath, width, height) {
   const buffer = fs.readFileSync(imagePath);
   const resizedBuffer = await sharp(buffer)
@@ -32,12 +36,20 @@ async function resizeImage(imagePath, width, height) {
   fs.writeFileSync(imagePath, resizedBuffer);
 }
 
+// Compare two screenshots and return similarity percentage
 async function compareScreenshots(baselinePath, currentPath, diffPath) {
+  if (!fs.existsSync(baselinePath) || !fs.existsSync(currentPath)) {
+    console.log(
+      chalk.red(`Missing file(s): ${baselinePath} or ${currentPath}`)
+    );
+    return "Error";
+  }
+
   await resizeImage(baselinePath, 1280, 800);
   await resizeImage(currentPath, 1280, 800);
 
-  const img1 = PNG.sync.read(fs.readFileSync(baselinePath));
-  const img2 = PNG.sync.read(fs.readFileSync(currentPath));
+  const img1 = PNG.sync.read(fs.readFileSync(baselinePath)); // Staging
+  const img2 = PNG.sync.read(fs.readFileSync(currentPath)); // Prod
 
   if (img1.width !== img2.width || img1.height !== img2.height) {
     console.log(
@@ -47,41 +59,34 @@ async function compareScreenshots(baselinePath, currentPath, diffPath) {
   }
 
   const diff = new PNG({ width: img1.width, height: img1.height });
+
+  pixelmatch(img1.data, img2.data, diff.data, img1.width, img1.height, {
+    threshold: 0.1,
+    diffColor: [0, 0, 255], // Blue for Prod Differences
+    diffColorAlt: [255, 165, 0], // Orange for Staging Differences
+  });
+
+  fs.writeFileSync(diffPath, PNG.sync.write(diff));
+
+  const totalPixels = img1.width * img1.height;
   const mismatchedPixels = pixelmatch(
     img1.data,
     img2.data,
-    diff.data,
+    null,
     img1.width,
     img1.height,
     { threshold: 0.1 }
   );
-  fs.writeFileSync(diffPath, PNG.sync.write(diff));
 
-  const totalPixels = img1.width * img1.height;
   const matchedPixels = totalPixels - mismatchedPixels;
   return (matchedPixels / totalPixels) * 100;
 }
 
-// Forcefully capture screenshot for a given URL
+// Capture screenshot for a given URL
 async function captureScreenshot(page, url, screenshotPath) {
   try {
     console.log(chalk.blue(`Navigating to: ${url}`));
-
-    const navigationPromise = page.goto(url, {
-      waitUntil: "networkidle",
-      timeout: 60000,
-    });
-    const timeoutPromise = new Promise(
-      (resolve) =>
-        setTimeout(() => {
-          console.log(
-            chalk.red(`Timeout detected on ${url}. Forcing screenshot.`)
-          );
-          resolve();
-        }, 10000) // Timeout after 10 seconds
-    );
-
-    await Promise.race([navigationPromise, timeoutPromise]);
+    await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
 
     ensureDirectoryExistence(screenshotPath);
     await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -90,9 +95,6 @@ async function captureScreenshot(page, url, screenshotPath) {
     console.error(
       chalk.red(`Failed to capture screenshot for ${url}: ${error.message}`)
     );
-    ensureDirectoryExistence(screenshotPath);
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-    console.log(chalk.green(`Forced screenshot captured: ${screenshotPath}`));
   }
 }
 
@@ -101,13 +103,26 @@ function generateHtmlReport(results, deviceName) {
   const reportPath = `visual_comparison_report_${deviceName}.html`;
   const now = new Date().toLocaleString();
   const environments = `
-    <a href="${config.staging.baseUrl}" target="_blank">Staging: ${config.staging.baseUrl}</a>,
-    <a href="${config.prod.baseUrl}" target="_blank">Prod: ${config.prod.baseUrl}</a>
+    <a href="${config.staging.baseUrl}" target="_blank" class="staging">Staging</a>,
+    <a href="${config.prod.baseUrl}" target="_blank" class="prod">Prod</a>
   `;
+
+  // Sort results: Failures first, then Pass
+  results.sort((a, b) => {
+    const aStatus =
+      typeof a.similarityPercentage === "number" && a.similarityPercentage >= 95
+        ? 1
+        : 0;
+    const bStatus =
+      typeof b.similarityPercentage === "number" && b.similarityPercentage >= 95
+        ? 1
+        : 0;
+    return aStatus - bStatus;
+  });
 
   let htmlContent = `
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
       <title>Visual Comparison Report - ${deviceName}</title>
       <style>
@@ -120,7 +135,15 @@ function generateHtmlReport(results, deviceName) {
         .pass { color: green; font-weight: bold; }
         .fail { color: red; font-weight: bold; }
         .error { color: orange; font-weight: bold; }
-        img { max-width: 150px; cursor: pointer; }
+        img { max-width: 200px; cursor: pointer; margin: 5px; }
+        .staging { color: rgb(255, 165, 0); font-weight: bold; }
+        .prod { color: rgb(0, 0, 255); font-weight: bold; }
+        .thumbnail-wrapper { display: inline-block; text-align: center; margin: 5px; }
+        .thumbnail-label { font-size: 12px; font-weight: bold; margin-top: 5px; }
+        .modal { display: none; position: fixed; z-index: 1000; padding: 50px; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.8); }
+        .modal img { margin: auto; display: block; max-width: 90%; max-height: 90%; }
+        .modal-close { position: absolute; top: 20px; right: 30px; font-size: 30px; font-weight: bold; color: white; cursor: pointer; }
+        .download-button { display: block; text-align: center; margin: 20px auto; padding: 10px 20px; font-size: 18px; background-color: #4CAF50; color: white; text-decoration: none; border-radius: 5px; width: 200px; }
       </style>
     </head>
     <body>
@@ -128,13 +151,6 @@ function generateHtmlReport(results, deviceName) {
       <h2>Device: ${deviceName}</h2>
       <div class="summary">
         <p>Total Pages Tested: ${results.length}</p>
-        <p>Passed: ${
-          results.filter(
-            (r) =>
-              typeof r.similarityPercentage === "number" &&
-              r.similarityPercentage >= 95
-          ).length
-        }</p>
         <p>Failed: ${
           results.filter(
             (r) =>
@@ -142,11 +158,19 @@ function generateHtmlReport(results, deviceName) {
               r.similarityPercentage < 95
           ).length
         }</p>
+        <p>Passed: ${
+          results.filter(
+            (r) =>
+              typeof r.similarityPercentage === "number" &&
+              r.similarityPercentage >= 95
+          ).length
+        }</p>
         <p>Errors: ${
           results.filter((r) => r.similarityPercentage === "Error").length
         }</p>
         <p>Last Run: ${now}</p>
         <p>Environments Tested: ${environments}</p>
+        <a href="${reportPath}" download class="download-button">Download Report</a>
       </div>
       <table>
         <thead>
@@ -154,50 +178,40 @@ function generateHtmlReport(results, deviceName) {
             <th>Page</th>
             <th>Similarity</th>
             <th>Status</th>
-            <th>Thumbnail</th>
+            <th>Thumbnails</th>
           </tr>
         </thead>
         <tbody>
   `;
 
   results.forEach((result) => {
-    const diffThumbnailPath = `screenshots/${deviceName}/diff/${result.pagePath.replace(
-      /\//g,
-      "_"
-    )}.png`;
-
-    const stagingUrl = `${config.staging.baseUrl}${result.pagePath}`;
-    const prodUrl = `${config.prod.baseUrl}${result.pagePath}`;
-
-    const statusClass =
-      typeof result.similarityPercentage === "number" &&
-      result.similarityPercentage >= 95
-        ? "pass"
-        : "fail";
+    const sanitizedPath = result.pagePath.replace(/\//g, "_");
+    const stagingPath = `screenshots/${deviceName}/staging/${sanitizedPath}.png`;
+    const prodPath = `screenshots/${deviceName}/prod/${sanitizedPath}.png`;
+    const diffPath = `screenshots/${deviceName}/diff/${sanitizedPath}.png`;
 
     htmlContent += `
       <tr>
-        <td>
-          <a href="${stagingUrl}" target="_blank">Staging</a> |
-          <a href="${prodUrl}" target="_blank">Prod</a>
+        <td><a href="${config.staging.baseUrl}${
+      result.pagePath
+    }" class="staging">Staging</a> |
+            <a href="${config.prod.baseUrl}${
+      result.pagePath
+    }" class="prod">Prod</a>
         </td>
         <td>${
           typeof result.similarityPercentage === "number"
             ? result.similarityPercentage.toFixed(2) + "%"
-            : result.similarityPercentage
+            : "Error"
         }</td>
-        <td class="${statusClass}">${
-      result.similarityPercentage === "Error"
-        ? "Error"
-        : result.similarityPercentage >= 95
-        ? "Pass"
-        : "Fail"
+        <td class="${result.similarityPercentage >= 95 ? "pass" : "fail"}">${
+      result.similarityPercentage >= 95 ? "Pass" : "Fail"
     }</td>
-        <td>${
-          fs.existsSync(diffThumbnailPath)
-            ? `<a href="${diffThumbnailPath}" target="_blank"><img src="${diffThumbnailPath}" /></a>`
-            : "N/A"
-        }</td>
+        <td>
+          <div class="thumbnail-wrapper"><img src="${stagingPath}" onclick="openModal('${stagingPath}')" alt="Staging"><div class="thumbnail-label">Staging</div></div>
+          <div class="thumbnail-wrapper"><img src="${prodPath}" onclick="openModal('${prodPath}')" alt="Prod"><div class="thumbnail-label">Prod</div></div>
+          <div class="thumbnail-wrapper"><img src="${diffPath}" onclick="openModal('${diffPath}')" alt="Diff"><div class="thumbnail-label">Diff</div></div>
+        </td>
       </tr>
     `;
   });
@@ -205,16 +219,31 @@ function generateHtmlReport(results, deviceName) {
   htmlContent += `
         </tbody>
       </table>
+
+      <div id="modal" class="modal">
+        <span class="modal-close" onclick="closeModal()">&times;</span>
+        <img id="modal-image">
+      </div>
+
+      <script>
+        function openModal(imageSrc) {
+          document.getElementById("modal-image").src = imageSrc;
+          document.getElementById("modal").style.display = "block";
+        }
+        function closeModal() {
+          document.getElementById("modal").style.display = "none";
+        }
+      </script>
     </body>
     </html>
   `;
 
   fs.writeFileSync(reportPath, htmlContent);
-  console.log(chalk.green(`HTML report generated: ${reportPath}`));
 }
 
 // Main Test Suite
 test.describe("Visual Comparison Tests", () => {
+  test.setTimeout(7200000);
   test("Compare staging and prod screenshots and generate HTML report", async ({
     browser,
   }) => {
